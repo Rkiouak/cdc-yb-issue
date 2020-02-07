@@ -1,0 +1,7 @@
+FROM clojure
+ENV yb-master yb-masters:7100
+ENV yb-tserver yb-tservers
+COPY . .
+COPY ./target/uberjar/cdc-yb-issue-0.1.0-SNAPSHOT-standalone.jar /usr/local/bin
+CMD ["java", "-jar", "/usr/local/bin/cdc-yb-issue-0.1.0-SNAPSHOT-standalone.jar"]
+#CMD ["lein", "run"]
