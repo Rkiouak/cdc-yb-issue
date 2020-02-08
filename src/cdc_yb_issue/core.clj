@@ -39,101 +39,6 @@
             repeat)
        (rest csv-data)))
 
-(defn recur-getChanges [hp table stream-id tabletId term index]
-  (let [recur-chan (chan 1)
-        exit-chan (chan 10)]
-    (go-loop [m {:hp         hp
-                 :table      table
-                 :stream-id  stream-id
-                 :tabletId   tabletId
-                 :term       term
-                 :index      index}]
-      (when m
-        (let [{:keys [hp table stream-id tabletId term index]} m]
-          (try (.getChanges ^AsyncYBClient @async-yb-client
-                            hp
-                            table
-                            stream-id
-                            tabletId
-                            term
-                            index
-                            (reify Callback
-                              (call [this getChangesResponse]
-                                (let [records (.getRecordsList (.getResp getChangesResponse))
-                                      new-term (.getTerm (.getOpId (.getCheckpoint (.getResp getChangesResponse))))
-                                      new-index (.getTerm (.getOpId (.getCheckpoint (.getResp getChangesResponse))))]
-                                  (when (not (empty? records))
-                                    (log/debug "Received " (str (count records)) " change records from YugabyteDB CDC for table: " (.getName table)))
-                                  (with-open [wr (io/writer "cdc.edn" :append true)]
-                                    (loop [records records
-                                           c 0]
-                                      (if (empty? records)
-                                        (when (> c 0)
-                                          (log/debug "Produced " (inc c) " records to cdc.edn from table: " (.getName table)))
-                                        (let [record (first records)
-                                              _ (log/debug record)
-                                              changes (map (fn [^CdcService$KeyValuePairPB a]
-                                                             {(keyword (String.
-                                                                         (.toByteArray (.getKey a))))
-                                                              (.getStringValue (.getValue a))})
-                                                           (.getChangesList record))
-                                              primary-keys (map (fn [^CdcService$KeyValuePairPB a]
-                                                                  {(keyword (String.
-                                                                              (.toByteArray (.getKey a))))
-                                                                   (.getStringValue (.getValue a))}) (.getKeyList record))]
-                                          (.write wr (pr-str {:table-name   (.getName table)
-                                                              :primary-keys primary-keys
-                                                              :new-values   changes
-                                                              :time         (.toString (.getTime record))
-                                                              :operation    (.toString (.getOperation record))
-                                                              :term         new-term
-                                                              :index        new-index
-                                                              :stream-id    stream-id
-                                                              :tablet-id    tabletId}))
-                                          (recur (rest records) (inc c)))))))
-                                (async/alt!  (timeout 100) (>! recur-chan {:hp        hp
-                                                                           :table     table
-                                                                           :stream-id stream-id
-                                                                           :tabletId  tabletId
-                                                                           :term      (.getTerm (.getOpId (.getCheckpoint (.getResp getChangesResponse))))
-                                                                           :index     (.getIndex (.getOpId (.getCheckpoint (.getResp getChangesResponse))))})
-                                             exit-chan nil))))
-               (catch Exception e
-                 (log/debug "Error in go loop"))))
-        (recur (<! recur-chan))))
-    exit-chan))
-
-(defn start-yb-cdc-listeners []
-  (let [table-infos (bean (.getTablesList @yb-client))
-        table-ids-and-names (map #(-> % bean (select-keys [:id :name :namespace])
-                                      (update :id (fn [x] (.toStringUtf8 x)))
-                                      (update :namespace (fn [x] (.getName x)))) (:tableInfoList table-infos))]
-    (doall (map #(assoc % :poller
-                        (let [table (.openTableByUUID @yb-client (:id %))]
-                          (log/debug "Polling for table: " (.getName table))
-                          (doseq [tablet (.getTabletsLocations table 30000)]
-                            (let [tabletId (String. (.getTabletId tablet))]
-                              (swap! close-chs conj (recur-getChanges (first (:host-and-ports %)) table (:stream-id %) tabletId 0 0))))))
-                (map (fn [x]
-                       (assoc x
-                              :stream-id
-                              (.getStreamId (.createCDCStream @yb-client (first (:host-and-ports x)) (:id x)))))
-                     (map
-                      (fn [{:keys [id name namespace]}]
-                        (.openTableByUUID @yb-client id)
-                        (let [tablet-servers-list (.getTabletServersList (.listTabletServers @yb-client))]
-                          {:id             id
-                           :name           name
-                           :keyspace       namespace
-                           :host-and-ports (into []
-                                                 (map (fn [x]
-                                                        (let [x (bean x)]
-                                                          (HostAndPort/fromParts
-                                                           (:host x)
-                                                           (:port x))))
-                                                      tablet-servers-list))}))
-                      table-ids-and-names))))))
-
 (defn setup-yb-conn-and-session []
   (let [default-timeout 30000]
     (doseq [close-ch @close-chs]
@@ -230,6 +135,10 @@
   (try (alia/execute @session "DROP TABLE cdc_yb.issue_replication;")
        (catch Exception e
          (log/debug "Exception dropping cdc_yb.issue_replication")
+         (log/debug e)))
+  (try (alia/execute @session "DROP TABLE cdc_yb.issue_replication_users;")
+       (catch Exception e
+         (log/debug "Exception dropping cdc_yb.issue_replication_users")
          (log/debug e)))
   (try (alia/execute @session "DROP TABLE cdc_yb.unmatched_changes;")
        (catch Exception e
